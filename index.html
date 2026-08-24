@@ -15,28 +15,20 @@
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
 <!-- ====================================================================
-     SETUP — fill these two spots in before hosting this file.
+     SETUP — fill this in before hosting this file.
      See the setup guide you were given alongside this file.
      ==================================================================== -->
 <script>
-  // 1) Your Firebase web app config (free "Spark" plan). This is safe to
-  //    expose publicly — Firebase configs are meant to be client-side.
-  window.FIREBASE_CONFIG = {    
+  // Your Firebase web app config (free "Spark" plan). This is safe to
+  // expose publicly — Firebase configs are meant to be client-side.
+  window.FIREBASE_CONFIG = {
     apiKey: "AIzaSyAyd2HO7nulNrBcBKU6q0vhqlWajclQVAI",
     authDomain: "plantnelope.firebaseapp.com",
     projectId: "plantnelope",
     storageBucket: "plantnelope.firebasestorage.app",
     messagingSenderId: "905282464776",
-    appId: "1:905282464776:web:94a350522799c5db4f35bd"
+    appId: "1:905282464776:web:94a350522799c5db4f35bd",
   };
-
-  // 2) Your own Anthropic API key, ONLY if you want the photo-identify
-  //    feature. Leave as null to skip it — everything else still works.
-  //    ⚠️ This key is visible to anyone who views this page's source.
-  //    Use a key with a low spend limit set in the Anthropic console,
-  //    treat it as a "burner" key for this app only, and don't reuse a
-  //    key you use elsewhere.
-  window.ANTHROPIC_API_KEY = null; // e.g. "sk-ant-api03-...."
 </script>
 
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
@@ -56,6 +48,16 @@
 </head>
 <body>
 <div id="root"></div>
+<div id="crash-banner" style="display:none; position:fixed; inset:0; background:#FBFAF6; color:#A24631; font-family:monospace; font-size:13px; padding:20px; white-space:pre-wrap; overflow:auto; z-index:9999;"></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var el = document.getElementById("crash-banner");
+    if (!el) return;
+    el.style.display = "block";
+    el.textContent = "Something broke while loading Plantnelope.\n\nShow this to Claude:\n\n" +
+      (e.message || "Unknown error") + "\n" + (e.filename ? (e.filename + ":" + e.lineno) : "");
+  });
+</script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useMemo } = React;
@@ -140,55 +142,13 @@ async function resizeImage(file, maxW, quality) {
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
 
-// ---------------------------------------------------------------------
-// Plant photo identification — Claude vision, using the user's own key
-// ---------------------------------------------------------------------
-async function identifyPlantFromPhoto(dataUrlForId) {
-  const base64 = dataUrlForId.split(",")[1];
-  const media_type = dataUrlForId.substring(5, dataUrlForId.indexOf(";"));
-  const prompt =
-    "You are helping identify a houseplant from a photo for a home watering-tracker app. " +
-    "Look carefully at leaf shape, growth habit, and pot context. " +
-    "Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this shape: " +
-    '{"commonName": string, "category": one of ' +
-    '["succulent","snake plant / ZZ","fern / prayer plant","tropical vine","herb","orchid","ficus","other"], ' +
-    '"baselineDays": integer (typical days between waterings indoors under medium indirect light, ' +
-    'a sensible number between 3 and 25), ' +
-    '"confidence": one of ["low","medium","high"], ' +
-    '"note": a short one-sentence care tip specific to this plant}. ' +
-    'If the photo does not clearly show a houseplant, set commonName to "Unknown", confidence to "low", ' +
-    'and note to explain briefly why.';
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": window.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-5",
-      max_tokens: 350,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image", source: { type: "base64", media_type, data: base64 } },
-          { type: "text", text: prompt },
-        ],
-      }],
-    }),
-  });
-
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => "");
-    throw new Error("API error " + response.status + ": " + errBody.slice(0, 200));
-  }
-  const data = await response.json();
-  const textBlock = (data.content || []).find((b) => b.type === "text");
-  if (!textBlock) throw new Error("No text in response");
-  const clean = textBlock.text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+// Safe localStorage — some browsers/settings (e.g. "Block All Cookies") throw on
+// any access, which would otherwise crash the whole app before it can render.
+function safeGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function safeSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
 }
 
 // ---------------------------------------------------------------------
@@ -236,7 +196,7 @@ function ConfigWarning() {
 }
 
 function PlantTracker() {
-  const [me, setMe] = useState(() => localStorage.getItem("plantnelope-me") || null);
+  const [me, setMe] = useState(() => safeGet("plantnelope-me") || null);
   const [plants, setPlants] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [expanded, setExpanded] = useState(null);
@@ -268,7 +228,7 @@ function PlantTracker() {
   }, [me]);
 
   function setName(name) {
-    localStorage.setItem("plantnelope-me", name);
+    safeSet("plantnelope-me", name);
     setMe(name);
   }
 
@@ -470,48 +430,18 @@ function PlantForm({ initial, onCancel, onSave }) {
   const [photo, setPhoto] = useState(initial?.photo || null);
   const [baselineDaysOverride, setBaselineDaysOverride] = useState(initial?.baselineDaysOverride ?? null);
   const [busy, setBusy] = useState(false);
-  const [idState, setIdState] = useState("idle"); // idle | working | done | error
-  const [idResult, setIdResult] = useState(null);
-  const [idErrorMsg, setIdErrorMsg] = useState("");
   const fileRef = useRef();
-  const hasKey = !!window.ANTHROPIC_API_KEY;
 
   async function handleFile(e) {
     const file = e.target.files?.[0];
     if (!file) return;
     setBusy(true);
-    setIdState("idle");
-    setIdResult(null);
     try {
-      // Two copies: a small one to store, a larger/sharper one just for identification.
       const storeUrl = await resizeImage(file, 480, 0.6);
       setPhoto(storeUrl);
-      setBusy(false);
-      if (hasKey) {
-        setIdState("working");
-        try {
-          const idUrl = await resizeImage(file, 900, 0.8);
-          const result = await identifyPlantFromPhoto(idUrl);
-          setIdResult(result);
-          setIdState("done");
-          if (result.commonName && result.commonName !== "Unknown") {
-            if (!type.trim()) setType(result.commonName);
-            if (result.baselineDays) setBaselineDaysOverride(result.baselineDays);
-          }
-        } catch (err) {
-          setIdState("error");
-          setIdErrorMsg(err.message || "Something went wrong.");
-        }
-      }
     } finally {
       setBusy(false);
     }
-  }
-
-  function acceptSuggestion() {
-    if (!idResult) return;
-    setType(idResult.commonName);
-    if (idResult.baselineDays) setBaselineDaysOverride(idResult.baselineDays);
   }
 
   function submit() {
@@ -538,28 +468,6 @@ function PlantForm({ initial, onCancel, onSave }) {
           {photo ? <img src={photo} alt="preview" style={styles.photoPreview} /> : <div style={styles.photoPickerEmpty}>{busy ? "Processing…" : "📷 Add a photo"}</div>}
         </div>
         <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} />
-        {!hasKey && (
-          <div style={styles.overrideNote}>Auto-identify is off — add an Anthropic API key in index.html to enable it.</div>
-        )}
-
-        {idState === "working" && <div style={styles.idBanner}>Identifying the plant from the photo…</div>}
-        {idState === "error" && (
-          <div style={{ ...styles.idBanner, ...styles.idBannerError }}>
-            Couldn't identify it automatically ({idErrorMsg}) — just fill in the type below.
-          </div>
-        )}
-        {idState === "done" && idResult && idResult.commonName !== "Unknown" && (
-          <div style={styles.idBanner}>
-            Looks like <strong>{idResult.commonName}</strong> ({idResult.confidence} confidence) — suggested watering every ~{idResult.baselineDays}d before light adjustment.
-            {idResult.note && <div style={{ marginTop: 4, fontStyle: "italic" }}>{idResult.note}</div>}
-            {type !== idResult.commonName && <button style={styles.idAcceptBtn} onClick={acceptSuggestion}>Use this</button>}
-          </div>
-        )}
-        {idState === "done" && idResult && idResult.commonName === "Unknown" && (
-          <div style={{ ...styles.idBanner, ...styles.idBannerError }}>
-            Couldn't recognize a plant in that photo{idResult.note ? ` — ${idResult.note}` : ""}. Try a clearer, well-lit shot of the whole plant, or fill in the type manually.
-          </div>
-        )}
 
         <label style={styles.label}>Name</label>
         <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Fernanda" />
@@ -642,9 +550,6 @@ const styles = {
   photoPicker: { height: 140, borderRadius: 14, background: "#EFECE3", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", overflow: "hidden", marginBottom: 6 },
   photoPreview: { width: "100%", height: "100%", objectFit: "cover" },
   photoPickerEmpty: { color: "#8A8374", fontSize: 14 },
-  idBanner: { fontSize: 13, background: "#EAF1E7", color: "#3F6B3D", padding: "9px 12px", borderRadius: 10, marginBottom: 4, lineHeight: 1.5 },
-  idBannerError: { background: "#F3EFE4", color: "#8A7B4F" },
-  idAcceptBtn: { marginLeft: 8, background: "#3F6B3D", color: "#fff", border: "none", borderRadius: 999, padding: "3px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" },
   overrideNote: { fontSize: 12, color: "#8A8374", marginTop: 4 },
   gateWrap: { minHeight: "100vh", background: "#F6F4EE", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, fontFamily: "'Inter', sans-serif" },
   gateCard: { background: "#fff", borderRadius: 20, padding: "32px 26px", maxWidth: 340, width: "100%", boxShadow: "0 4px 20px rgba(46,43,36,0.08)" },
