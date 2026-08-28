@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Plantnelope</title>
+<meta name="theme-color" content="#3F6B3D" />
+<link rel="manifest" href="manifest.json?v=2" />
+<link rel="apple-touch-icon" href="icon-180.png?v=2" />
+<link rel="icon" href="favicon.png?v=2" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Plantnelope" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- ====================================================================
+     SETUP — fill this in before hosting this file.
+     See the setup guide you were given alongside this file.
+     ==================================================================== -->
+<script>
+  // Your Firebase web app config (free "Spark" plan). This is safe to
+  // expose publicly — Firebase configs are meant to be client-side.
+  window.FIREBASE_CONFIG = {
+    apiKey: "AIzaSyAyd2HO7nulNrBcBKU6q0vhqlWajclQVAI",
+    authDomain: "plantnelope.firebaseapp.com",
+    projectId: "plantnelope",
+    storageBucket: "plantnelope.firebasestorage.app",
+    messagingSenderId: "905282464776",
+    appId: "1:905282464776:web:94a350522799c5db4f35bd",
+  };
+</script>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #F6F4EE; overscroll-behavior: none; }
+  body { font-family: 'Inter', sans-serif; color: #2E2B24; }
+  #root { min-height: 100vh; }
+  input, button { font-family: inherit; }
+  ::-webkit-scrollbar { width: 0; height: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="crash-banner" style="display:none; position:fixed; inset:0; background:#FBFAF6; color:#A24631; font-family:monospace; font-size:13px; padding:20px; white-space:pre-wrap; overflow:auto; z-index:9999;"></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var el = document.getElementById("crash-banner");
+    if (!el) return;
+    el.style.display = "block";
+    el.textContent = "Something broke while loading Plantnelope.\n\nShow this to Claude:\n\n" +
+      (e.message || "Unknown error") + "\n" + (e.filename ? (e.filename + ":" + e.lineno) : "");
+  });
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ---------------------------------------------------------------------
+// Firebase (shared storage across both of you, real-time)
+// ---------------------------------------------------------------------
+let db = null;
+let firebaseReady = false;
+try {
+  firebase.initializeApp(window.FIREBASE_CONFIG);
+  db = firebase.firestore();
+  firebaseReady = !window.FIREBASE_CONFIG.apiKey.startsWith("PASTE");
+} catch (e) {
+  firebaseReady = false;
+}
+
+// ---------------------------------------------------------------------
+// Care rules: baseline days between watering by plant type, adjusted by light
+// ---------------------------------------------------------------------
+const TYPE_BASELINES = [
+  { match: /succulent|cactus|aloe|jade|echeveria/i, days: 16 },
+  { match: /snake|zz|sansevieria|zamioculcas/i, days: 21 },
+  { match: /fern|calathea|maranta|prayer/i, days: 5 },
+  { match: /pothos|philodendron|monstera|ivy|heartleaf/i, days: 8 },
+  { match: /herb|basil|mint|rosemary/i, days: 3 },
+  { match: /orchid/i, days: 10 },
+  { match: /fiddle|ficus|rubber/i, days: 9 },
+];
+const DEFAULT_BASELINE = 7;
+const LIGHT_MULTIPLIER = { low: 1.35, medium: 1.0, "bright indirect": 0.85, direct: 0.65 };
+const SUNLIGHT_OPTIONS = ["low", "medium", "bright indirect", "direct"];
+
+function baselineDaysFor(type) {
+  const hit = TYPE_BASELINES.find((t) => t.match.test(type || ""));
+  return hit ? hit.days : DEFAULT_BASELINE;
+}
+function recommendedInterval(plant) {
+  const base = plant.baselineDaysOverride ?? baselineDaysFor(plant.type);
+  const mult = LIGHT_MULTIPLIER[plant.sunlight] ?? 1;
+  return Math.max(2, Math.round(base * mult));
+}
+function daysSince(ts) { return Math.floor((Date.now() - ts) / 86400000); }
+function lastWatering(plant) {
+  if (!plant.history || plant.history.length === 0) return null;
+  return plant.history[plant.history.length - 1];
+}
+function statusFor(plant) {
+  const last = lastWatering(plant);
+  const interval = recommendedInterval(plant);
+  if (!last) return { daysLeft: null, pct: 0, tone: "unknown" };
+  const since = daysSince(last.ts);
+  const pct = Math.min(1, since / interval);
+  const daysLeft = interval - since;
+  let tone = "ok";
+  if (daysLeft <= 0) tone = "overdue";
+  else if (daysLeft <= 1) tone = "soon";
+  return { daysLeft, pct, tone, interval, since };
+}
+
+async function resizeImage(file, maxW, quality) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxW / img.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+
+// Safe localStorage — some browsers/settings (e.g. "Block All Cookies") throw on
+// any access, which would otherwise crash the whole app before it can render.
+function safeGet(key) {
+  try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function safeSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+}
+
+// ---------------------------------------------------------------------
+// UI pieces
+// ---------------------------------------------------------------------
+function MoistureRing({ pct, tone, size = 64 }) {
+  const r = size / 2 - 5;
+  const c = 2 * Math.PI * r;
+  const colors = { ok: "#5B8C5A", soon: "#C99A3E", overdue: "#B5533C", unknown: "#9B9384" };
+  const color = colors[tone] || colors.unknown;
+  const offset = c * (1 - pct);
+  return (
+    <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+      <circle cx={size / 2} cy={size / 2} r={r} stroke="#E7E2D6" strokeWidth="5" fill="none" />
+      <circle cx={size / 2} cy={size / 2} r={r} stroke={color} strokeWidth="5" fill="none"
+        strokeDasharray={c} strokeDashoffset={offset} strokeLinecap="round"
+        style={{ transition: "stroke-dashoffset 0.4s ease" }} />
+    </svg>
+  );
+}
+
+function NameGate({ onSet }) {
+  return (
+    <div style={styles.gateWrap}>
+      <div style={styles.gateCard}>
+        <div style={styles.gateEyebrow}>PLANTNELOPE</div>
+        <h1 style={styles.gateTitle}>Who's tending today?</h1>
+        <p style={styles.gateSub}>Pick your name — it gets attached to each watering.</p>
+        <div style={styles.namePickerRow}>
+          <button style={styles.namePickBtn} onClick={() => onSet("Penelope")}>Penelope</button>
+          <button style={styles.namePickBtn} onClick={() => onSet("Nathaniel")}>Nathaniel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigWarning() {
+  return (
+    <div style={styles.configWarning}>
+      <strong>Setup not finished:</strong> this page needs a Firebase config pasted into the
+      script tag near the top of index.html before it can save or share data. See the setup guide.
+    </div>
+  );
+}
+
+function PlantTracker() {
+  const [me, setMe] = useState(() => safeGet("plantnelope-me") || null);
+  const [plants, setPlants] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Lock the background page from scrolling while a modal is open — plain
+  // overflow:hidden isn't enough on iOS Safari, so we also pin body position.
+  useEffect(() => {
+    const locked = !!expanded || showAdd || !!editing;
+    if (locked) {
+      const scrollY = window.scrollY;
+      document.body.dataset.scrollY = String(scrollY);
+      document.body.style.position = "fixed";
+      document.body.style.top = `-${scrollY}px`;
+      document.body.style.left = "0";
+      document.body.style.right = "0";
+    } else {
+      const scrollY = parseInt(document.body.dataset.scrollY || "0", 10);
+      document.body.style.position = "";
+      document.body.style.top = "";
+      document.body.style.left = "";
+      document.body.style.right = "";
+      window.scrollTo(0, scrollY);
+    }
+  }, [expanded, showAdd, editing]);
+
+  // Real-time shared listener — either of you saving updates both screens live.
+  useEffect(() => {
+    if (!me || !firebaseReady) {
+      if (me && !firebaseReady) setPlants([]);
+      return;
+    }
+    const unsub = db.collection("plants").onSnapshot(
+      (snap) => {
+        const next = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setPlants(next);
+        setLoadError(null);
+      },
+      (err) => setLoadError("Couldn't load shared data: " + err.message)
+    );
+    return () => unsub();
+  }, [me]);
+
+  function setName(name) {
+    safeSet("plantnelope-me", name);
+    setMe(name);
+  }
+
+  async function waterPlant(id, ts) {
+    if (!firebaseReady) return;
+    const plant = plants.find((p) => p.id === id);
+    const nextHistory = [...(plant.history || []), { ts: ts ?? Date.now(), person: me }].sort((a, b) => a.ts - b.ts);
+    setSaving(true);
+    try {
+      await db.collection("plants").doc(id).update({ history: nextHistory });
+    } catch (e) {
+      setLoadError("Couldn't save: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteWatering(id, index) {
+    if (!firebaseReady) return;
+    const plant = plants.find((p) => p.id === id);
+    const nextHistory = (plant.history || []).filter((_, i) => i !== index);
+    setSaving(true);
+    try {
+      await db.collection("plants").doc(id).update({ history: nextHistory });
+    } catch (e) {
+      setLoadError("Couldn't save: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removePlant(id) {
+    if (!firebaseReady) return;
+    setSaving(true);
+    try {
+      await db.collection("plants").doc(id).delete();
+      setExpanded(null);
+    } catch (e) {
+      setLoadError("Couldn't remove: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function upsertPlant(plant) {
+    if (!firebaseReady) return;
+    setSaving(true);
+    try {
+      const { id, ...rest } = plant;
+      await db.collection("plants").doc(id).set(rest, { merge: true });
+      setShowAdd(false);
+      setEditing(null);
+    } catch (e) {
+      setLoadError("Couldn't save: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const sorted = useMemo(() => {
+    if (!plants) return [];
+    return [...plants].sort((a, b) => {
+      const sa = statusFor(a).daysLeft, sb = statusFor(b).daysLeft;
+      if (sa === null) return -1;
+      if (sb === null) return 1;
+      return sa - sb;
+    });
+  }, [plants, now]);
+
+  if (!me) return <NameGate onSet={setName} />;
+
+  return (
+    <div style={styles.page}>
+      <header style={styles.header}>
+        <div>
+          <div style={styles.eyebrow}>PLANTNELOPE</div>
+          <h1 style={styles.h1}>Plantnelope</h1>
+        </div>
+        <div style={styles.headerRight}>
+          <span style={styles.meTag}>{me}</span>
+          <button style={styles.btnPrimary} onClick={() => setShowAdd(true)}>+ Add plant</button>
+        </div>
+      </header>
+
+      {!firebaseReady && <ConfigWarning />}
+      {loadError && <div style={styles.errorBanner}>{loadError}</div>}
+
+      {plants === null ? (
+        <div style={styles.loading}>Loading the garden…</div>
+      ) : plants.length === 0 ? (
+        <div style={styles.empty}>
+          <div style={styles.emptyTitle}>No plants yet</div>
+          <p style={styles.emptyBody}>Add your first plant — a photo, a name, and where it lives.</p>
+          <button style={styles.btnPrimary} onClick={() => setShowAdd(true)}>+ Add plant</button>
+        </div>
+      ) : (
+        <div style={styles.grid}>
+          {sorted.map((p) => (
+            <PlantCard key={p.id} plant={p} onWater={() => waterPlant(p.id)} onOpen={() => setExpanded(p.id)} />
+          ))}
+        </div>
+      )}
+
+      {saving && <div style={styles.savingTag}>saving…</div>}
+
+      {expanded && (
+        <PlantDetail
+          plant={plants.find((p) => p.id === expanded)}
+          onClose={() => setExpanded(null)}
+          onWater={() => waterPlant(expanded)}
+          onWaterAt={(ts) => waterPlant(expanded, ts)}
+          onDeleteWatering={(index) => deleteWatering(expanded, index)}
+          onEdit={(p) => { setEditing(p); setExpanded(null); }}
+          onRemove={() => removePlant(expanded)}
+        />
+      )}
+
+      {(showAdd || editing) && (
+        <PlantForm
+          initial={editing}
+          onCancel={() => { setShowAdd(false); setEditing(null); }}
+          onSave={upsertPlant}
+        />
+      )}
+    </div>
+  );
+}
+
+function PlantCard({ plant, onWater, onOpen }) {
+  const s = statusFor(plant);
+  const last = lastWatering(plant);
+  const toneCopy = {
+    ok: `water in ${s.daysLeft}d`,
+    soon: s.daysLeft === 1 ? "water tomorrow" : "water today",
+    overdue: `overdue ${Math.abs(s.daysLeft)}d`,
+    unknown: "log first watering",
+  };
+  return (
+    <div style={styles.card} onClick={onOpen}>
+      <div style={styles.cardPhotoWrap}>
+        {plant.photo ? <img src={plant.photo} alt={plant.name} style={styles.cardPhoto} /> : <div style={styles.cardPhotoPlaceholder}>🌿</div>}
+        <div style={styles.cardRingBadge}><MoistureRing pct={s.pct} tone={s.tone} size={30} /></div>
+      </div>
+      <div style={styles.cardBody}>
+        <div style={styles.cardName}>{plant.name}</div>
+        <div style={styles.cardLoc}>{plant.type || "Unknown type"}</div>
+        <div style={{ ...styles.statusPill, ...statusPillTone[s.tone] }}>{toneCopy[s.tone]}</div>
+        <button
+          style={styles.btnWater}
+          onClick={(e) => { e.stopPropagation(); onWater(); }}
+        >
+          Water now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PlantDetail({ plant, onClose, onWater, onWaterAt, onDeleteWatering, onEdit, onRemove }) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showBackdate, setShowBackdate] = useState(false);
+  const [backdateValue, setBackdateValue] = useState(() => {
+    const d = new Date();
+    return d.toISOString().slice(0, 10);
+  });
+  if (!plant) return null;
+  const s = statusFor(plant);
+  const interval = recommendedInterval(plant);
+  const history = [...(plant.history || [])].reverse();
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <button style={styles.closeBtn} onClick={onClose}>✕</button>
+        {plant.photo && <img src={plant.photo} alt={plant.name} style={styles.modalPhoto} />}
+        <h2 style={styles.modalTitle}>{plant.name}</h2>
+        <div style={styles.modalMeta}>{plant.type || "Unspecified type"} · {plant.location} · {plant.sunlight} light</div>
+        <div style={styles.modalRecommend}>
+          Recommended: water roughly every {interval} days
+          {s.daysLeft !== null && (
+            <span style={{ color: statusPillTone[s.tone].color, fontWeight: 600 }}>
+              {"  ·  "}{s.tone === "overdue" ? `${Math.abs(s.daysLeft)}d overdue` : `${s.daysLeft}d left`}
+            </span>
+          )}
+        </div>
+        <button style={{ ...styles.btnWater, marginTop: 12 }} onClick={onWater}>Water now</button>
+
+        {!showBackdate ? (
+          <button style={styles.linkBtn} onClick={() => setShowBackdate(true)}>Log a past watering…</button>
+        ) : (
+          <div style={styles.backdateRow}>
+            <input
+              type="date"
+              style={styles.dateInput}
+              value={backdateValue}
+              max={new Date().toISOString().slice(0, 10)}
+              onChange={(e) => setBackdateValue(e.target.value)}
+            />
+            <button
+              style={styles.btnSecondary}
+              onClick={() => {
+                const ts = new Date(backdateValue + "T12:00:00").getTime();
+                onWaterAt(ts);
+                setShowBackdate(false);
+              }}
+            >
+              Add entry
+            </button>
+            <button style={styles.linkBtn} onClick={() => setShowBackdate(false)}>Cancel</button>
+          </div>
+        )}
+
+        <div style={styles.historyHeader}>Watering history</div>
+        <div style={styles.historyList}>
+          {history.length === 0 && <div style={styles.emptyBody}>No entries yet.</div>}
+          {history.map((h, i) => {
+            const originalIndex = (plant.history || []).length - 1 - i;
+            return (
+              <div key={i} style={styles.historyRow}>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <span>{new Date(h.ts).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
+                  <span style={{ color: "#6B6355" }}>{h.person}</span>
+                </div>
+                <button
+                  style={styles.historyDeleteBtn}
+                  onClick={() => onDeleteWatering(originalIndex)}
+                  aria-label="Delete this entry"
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={styles.modalActions}>
+          <button style={styles.btnSecondary} onClick={() => onEdit(plant)}>Edit</button>
+          {!confirmDelete ? (
+            <button style={styles.btnDanger} onClick={() => setConfirmDelete(true)}>Remove plant</button>
+          ) : (
+            <>
+              <span style={{ fontSize: 13, color: "#B5533C" }}>Remove for good?</span>
+              <button style={styles.btnDanger} onClick={onRemove}>Yes, remove</button>
+              <button style={styles.btnSecondary} onClick={() => setConfirmDelete(false)}>Cancel</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlantForm({ initial, onCancel, onSave }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [type, setType] = useState(initial?.type || "");
+  const [location, setLocation] = useState(initial?.location || "");
+  const [sunlight, setSunlight] = useState(initial?.sunlight || "medium");
+  const [photo, setPhoto] = useState(initial?.photo || null);
+  const [baselineDaysOverride, setBaselineDaysOverride] = useState(initial?.baselineDaysOverride ?? null);
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef();
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    try {
+      const storeUrl = await resizeImage(file, 480, 0.6);
+      setPhoto(storeUrl);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submit() {
+    if (!name.trim()) return;
+    onSave({
+      id: initial?.id || uid(),
+      name: name.trim(),
+      type: type.trim(),
+      location: location.trim(),
+      sunlight,
+      photo,
+      baselineDaysOverride,
+      history: initial?.history || [],
+    });
+  }
+
+  return (
+    <div style={styles.overlay} onClick={onCancel}>
+      <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+        <button style={styles.closeBtn} onClick={onCancel}>✕</button>
+        <h2 style={styles.modalTitle}>{initial ? "Edit plant" : "Add a plant"}</h2>
+
+        <div style={styles.photoPicker} onClick={() => fileRef.current?.click()}>
+          {photo ? <img src={photo} alt="preview" style={styles.photoPreview} /> : <div style={styles.photoPickerEmpty}>{busy ? "Processing…" : "📷 Add a photo"}</div>}
+        </div>
+        <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} />
+
+        <label style={styles.label}>Name</label>
+        <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Fernanda" />
+
+        <label style={styles.label}>Type</label>
+        <input style={styles.input} value={type} onChange={(e) => setType(e.target.value)} placeholder="e.g. Monstera, Snake plant, Pothos" />
+
+        <label style={styles.label}>Watering frequency override (optional)</label>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="number"
+            min="1"
+            max="90"
+            style={{ ...styles.input, width: 90 }}
+            value={baselineDaysOverride ?? ""}
+            onChange={(e) => setBaselineDaysOverride(e.target.value ? Number(e.target.value) : null)}
+            placeholder="e.g. 10"
+          />
+          <span style={{ fontSize: 13, color: "#8A8374" }}>days between waterings</span>
+        </div>
+        <div style={styles.overrideNote}>
+          {baselineDaysOverride
+            ? "Using your own number instead of the auto-estimate (still adjusted for sunlight below)."
+            : "Leave blank to auto-estimate from the type above — or set your own if you've looked up better care info."}
+        </div>
+
+        <label style={styles.label}>Location in the apartment</label>
+        <input style={styles.input} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="e.g. Living room window" />
+
+        <label style={styles.label}>Sunlight it gets there</label>
+        <div style={styles.segmented}>
+          {SUNLIGHT_OPTIONS.map((opt) => (
+            <button key={opt} style={{ ...styles.segBtn, ...(sunlight === opt ? styles.segBtnActive : {}) }} onClick={() => setSunlight(opt)}>{opt}</button>
+          ))}
+        </div>
+
+        <div style={styles.modalActions}>
+          <button style={styles.btnSecondary} onClick={onCancel}>Cancel</button>
+          <button style={styles.btnPrimary} disabled={!name.trim()} onClick={submit}>{initial ? "Save changes" : "Add plant"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const statusPillTone = {
+  ok: { background: "#EAF1E7", color: "#3F6B3D" },
+  soon: { background: "#FBF0DC", color: "#8A651F" },
+  overdue: { background: "#F7E4DE", color: "#A24631" },
+  unknown: { background: "#EFECE3", color: "#7A7364" },
+};
+
+const styles = {
+  page: { fontFamily: "'Inter', sans-serif", background: "#F6F4EE", minHeight: "100vh", padding: "calc(20px + env(safe-area-inset-top)) 16px 60px", color: "#2E2B24", boxSizing: "border-box" },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 12, marginBottom: 24, marginTop: 8 },
+  headerRight: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" },
+  eyebrow: { fontSize: 11, letterSpacing: "0.14em", fontWeight: 600, color: "#5B8C5A", marginBottom: 4 },
+  h1: { fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 600, margin: 0, color: "#2E2B24" },
+  meTag: { fontSize: 12, color: "#7A7364" },
+  grid: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 },
+  card: { background: "#FFFFFF", borderRadius: 14, overflow: "hidden", boxShadow: "0 1px 3px rgba(46,43,36,0.08)", display: "flex", flexDirection: "column", cursor: "pointer" },
+  cardPhotoWrap: { position: "relative", aspectRatio: "3 / 4", background: "#EFECE3" },
+  cardPhoto: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
+  cardPhotoPlaceholder: { width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32 },
+  cardRingBadge: { position: "absolute", top: 6, right: 6, background: "rgba(255,255,255,0.85)", borderRadius: "50%", padding: 2, lineHeight: 0 },
+  cardBody: { padding: 8, display: "flex", flexDirection: "column", gap: 5 },
+  cardTopRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" },
+  cardName: { fontFamily: "'Fraunces', serif", fontSize: 13.5, fontWeight: 600, lineHeight: 1.2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  cardLoc: { fontSize: 10.5, color: "#8A8374", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  statusPill: { fontSize: 10, fontWeight: 600, padding: "3px 7px", borderRadius: 999, alignSelf: "flex-start" },
+  lastRow: { fontSize: 12, color: "#8A8374" },
+  btnWater: { marginTop: 4, background: "#3F6B3D", color: "#fff", border: "none", borderRadius: 8, padding: "10px 6px", fontWeight: 600, fontSize: 11, cursor: "pointer" },
+  btnPrimary: { background: "#3F6B3D", color: "#fff", border: "none", borderRadius: 10, padding: "10px 16px", fontWeight: 600, fontSize: 14, cursor: "pointer" },
+  btnSecondary: { background: "#EFECE3", color: "#2E2B24", border: "none", borderRadius: 10, padding: "10px 16px", fontWeight: 600, fontSize: 14, cursor: "pointer" },
+  btnDanger: { background: "#F7E4DE", color: "#A24631", border: "none", borderRadius: 10, padding: "10px 16px", fontWeight: 600, fontSize: 14, cursor: "pointer" },
+  loading: { textAlign: "center", padding: 60, color: "#8A8374" },
+  empty: { textAlign: "center", padding: "60px 20px", background: "#FFFFFF", borderRadius: 16 },
+  emptyTitle: { fontFamily: "'Fraunces', serif", fontSize: 22, marginBottom: 6 },
+  emptyBody: { color: "#8A8374", marginBottom: 16, fontSize: 14 },
+  savingTag: { position: "fixed", bottom: 16, right: 16, fontSize: 12, color: "#8A8374", background: "#fff", padding: "6px 12px", borderRadius: 999, boxShadow: "0 1px 3px rgba(0,0,0,0.1)" },
+  errorBanner: { background: "#F7E4DE", color: "#A24631", padding: "10px 14px", borderRadius: 10, marginBottom: 16, fontSize: 13.5 },
+  configWarning: { background: "#FBF0DC", color: "#8A651F", padding: "12px 14px", borderRadius: 10, marginBottom: 16, fontSize: 13.5, lineHeight: 1.5 },
+  overlay: { position: "fixed", inset: 0, background: "rgba(46,43,36,0.45)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 50 },
+  modal: { background: "#FBFAF6", width: "100%", maxWidth: 480, maxHeight: "88vh", overflowY: "auto", borderRadius: "20px 20px 0 0", padding: "24px 20px 28px", position: "relative", boxSizing: "border-box" },
+  closeBtn: { position: "absolute", top: 14, right: 14, background: "#EFECE3", border: "none", borderRadius: "50%", width: 30, height: 30, cursor: "pointer", fontSize: 14 },
+  modalPhoto: { width: "100%", height: 180, objectFit: "cover", borderRadius: 14, marginBottom: 14 },
+  modalTitle: { fontFamily: "'Fraunces', serif", fontSize: 24, margin: "0 0 4px" },
+  modalMeta: { fontSize: 13, color: "#8A8374", marginBottom: 10 },
+  modalRecommend: { fontSize: 13.5, background: "#EAF1E7", padding: "10px 12px", borderRadius: 10, color: "#3F6B3D" },
+  linkBtn: { display: "block", background: "none", border: "none", color: "#5B8C5A", fontSize: 13, fontWeight: 600, cursor: "pointer", padding: "8px 0", marginTop: 6, textAlign: "left" },
+  backdateRow: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 4 },
+  dateInput: { padding: "9px 10px", borderRadius: 10, border: "1px solid #E2DDD0", fontSize: 14, fontFamily: "'Inter', sans-serif" },
+  historyHeader: { fontFamily: "'Fraunces', serif", fontSize: 16, marginTop: 22, marginBottom: 8 },
+  historyList: { display: "flex", flexDirection: "column", gap: 6, maxHeight: 180, overflowY: "auto" },
+  historyRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 13.5, borderBottom: "1px solid #EFECE3", padding: "6px 2px" },
+  historyDeleteBtn: { background: "none", border: "none", color: "#B5533C", fontSize: 13, cursor: "pointer", padding: "2px 6px", opacity: 0.6 },
+  modalActions: { display: "flex", gap: 10, marginTop: 20, flexWrap: "wrap", alignItems: "center" },
+  label: { fontSize: 12.5, fontWeight: 600, color: "#7A7364", marginTop: 14, marginBottom: 6, display: "block" },
+  input: { width: "100%", padding: "11px 12px", borderRadius: 10, border: "1px solid #E2DDD0", fontSize: 14.5, boxSizing: "border-box", fontFamily: "'Inter', sans-serif" },
+  segmented: { display: "flex", gap: 6, flexWrap: "wrap" },
+  segBtn: { padding: "8px 12px", borderRadius: 999, border: "1px solid #E2DDD0", background: "#fff", fontSize: 13, cursor: "pointer", color: "#5A5548" },
+  segBtnActive: { background: "#3F6B3D", color: "#fff", borderColor: "#3F6B3D" },
+  photoPicker: { height: 140, borderRadius: 14, background: "#EFECE3", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", overflow: "hidden", marginBottom: 6 },
+  photoPreview: { width: "100%", height: "100%", objectFit: "cover" },
+  photoPickerEmpty: { color: "#8A8374", fontSize: 14 },
+  overrideNote: { fontSize: 12, color: "#8A8374", marginTop: 4 },
+  gateWrap: { minHeight: "100vh", background: "#F6F4EE", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, fontFamily: "'Inter', sans-serif" },
+  gateCard: { background: "#fff", borderRadius: 20, padding: "32px 26px", maxWidth: 340, width: "100%", boxShadow: "0 4px 20px rgba(46,43,36,0.08)" },
+  gateEyebrow: { fontSize: 11, letterSpacing: "0.14em", fontWeight: 600, color: "#5B8C5A", marginBottom: 8 },
+  gateTitle: { fontFamily: "'Fraunces', serif", fontSize: 24, margin: "0 0 8px" },
+  gateSub: { fontSize: 13.5, color: "#8A8374", marginBottom: 18, lineHeight: 1.5 },
+  namePickerRow: { display: "flex", flexDirection: "column", gap: 10 },
+  namePickBtn: { background: "#3F6B3D", color: "#fff", border: "none", borderRadius: 10, padding: "13px 0", fontWeight: 600, fontSize: 15, cursor: "pointer", fontFamily: "'Inter', sans-serif" },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<PlantTracker />);
+</script>
+</body>
+</html>
